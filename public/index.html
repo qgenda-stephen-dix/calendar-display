@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Calendar Display</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    /* E-ink / TRMNL X: white bg, black text, grayscale only */
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: #ffffff;
+      color: #000000;
+      padding: 2rem 2.5rem;
+      max-width: 860px;
+      margin: 0 auto;
+    }
+
+    header {
+      border-bottom: 3px solid #000;
+      padding-bottom: 1rem;
+      margin-bottom: 0.5rem;
+    }
+
+    h1 { font-size: 2rem; font-weight: 700; }
+
+    #status { font-size: 0.85rem; color: #555; margin-top: 0.3rem; }
+
+    .legend {
+      display: flex;
+      gap: 1.5rem;
+      flex-wrap: wrap;
+      margin: 0.75rem 0 1.25rem;
+      font-size: 0.82rem;
+      color: #444;
+    }
+
+    .legend-item { display: flex; align-items: center; gap: 0.4rem; }
+    .legend-bar { width: 14px; height: 14px; border-radius: 2px; flex-shrink: 0; }
+
+    .day-header {
+      font-size: 0.78rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: #333;
+      background: #eeeeee;
+      padding: 0.4rem 0.75rem;
+      margin: 1.25rem 0 0.35rem;
+    }
+
+    .event {
+      border-left: 6px solid #000;
+      padding: 0.65rem 0.9rem;
+      margin-bottom: 5px;
+      background: #fafafa;
+    }
+
+    .event-time {
+      font-size: 0.78rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: #444;
+      margin-bottom: 0.2rem;
+    }
+
+    .event-title {
+      font-size: 1.05rem;
+      font-weight: 700;
+      line-height: 1.25;
+    }
+
+    .event-detail { font-size: 0.8rem; color: #555; margin-top: 0.2rem; }
+
+    .event-cal {
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      color: #777;
+      margin-top: 0.35rem;
+    }
+
+    #error-banner {
+      display: none;
+      border: 2px solid #000;
+      padding: 0.6rem 0.9rem;
+      margin-bottom: 1rem;
+      font-size: 0.9rem;
+      background: #f5f5f5;
+    }
+
+    #empty-state {
+      text-align: center;
+      color: #888;
+      font-size: 1rem;
+      padding: 3rem 0;
+    }
+    .sce-widget {
+      margin: 2rem 0 0;
+      border-top: 3px solid #000;
+      padding-top: 1.25rem;
+      display: flex;
+      gap: 2.5rem;
+      flex-wrap: wrap;
+    }
+    .sce-label {
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: #555;
+      margin-bottom: 3px;
+    }
+    .sce-value { font-size: 1.5rem; font-weight: 700; }
+    .sce-error { font-size: 0.85rem; color: #888; font-style: italic; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Upcoming Events</h1>
+    <div id="status">Loading…</div>
+  </header>
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-bar" style="background:#000"></div>Stephen</div>
+    <div class="legend-item"><div class="legend-bar" style="background:#444"></div>Stephen Work</div>
+    <div class="legend-item"><div class="legend-bar" style="background:#888"></div>Melissa</div>
+    <div class="legend-item"><div class="legend-bar" style="background:#bbb"></div>Broncos</div>
+  </div>
+
+  <div id="error-banner"></div>
+  <div id="events-container"><div id="empty-state">Fetching events…</div></div>
+  <div id="sce-widget" class="sce-widget"></div>
+
+  <script>
+    const REFRESH_MS = 15 * 60 * 1000;
+
+    function timeStr(iso, allDay) {
+      if (allDay) return 'All Day';
+      return new Date(iso).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+    }
+
+    function dayKey(iso, allDay) {
+      const d = allDay ? new Date(iso + 'T00:00:00') : new Date(iso);
+      return d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+    }
+
+    async function fetchAndRender() {
+      const statusEl  = document.getElementById('status');
+      const container = document.getElementById('events-container');
+      const errorEl   = document.getElementById('error-banner');
+
+      statusEl.textContent = 'Refreshing…';
+      errorEl.style.display = 'none';
+
+      try {
+        const resp = await fetch('/api/events');
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const { events, fetchedAt } = await resp.json();
+
+        container.innerHTML = '';
+
+        if (!events || events.length === 0) {
+          container.innerHTML = '<div id="empty-state">No events in the next 48 hours.</div>';
+        } else {
+          const groups = [];
+          let curDay = null;
+          for (const ev of events) {
+            const label = dayKey(ev.start, ev.allDay);
+            if (label !== curDay) { curDay = label; groups.push({ day: label, events: [] }); }
+            groups[groups.length - 1].events.push(ev);
+          }
+
+          for (const g of groups) {
+            const dayEl = document.createElement('div');
+            dayEl.className = 'day-header';
+            dayEl.textContent = g.day;
+            container.appendChild(dayEl);
+
+            for (const ev of g.events) {
+              const card = document.createElement('div');
+              card.className = 'event';
+              card.style.borderLeftColor = ev.gray;  // gray comes from API, no local lookup needed
+              const loc = ev.location ? `<div class="event-detail">📍 ${ev.location}</div>` : '';
+              const att = ev.attendees?.length ? `<div class="event-detail">👥 ${ev.attendees.join(', ')}</div>` : '';
+              card.innerHTML = `
+                <div class="event-time">${timeStr(ev.start, ev.allDay)}</div>
+                <div class="event-title">${ev.title}</div>
+                ${loc}${att}
+                <div class="event-cal">${ev.calendar}</div>`;
+              container.appendChild(card);
+            }
+          }
+        }
+
+        const t = new Date(fetchedAt).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+        statusEl.textContent = `Next 48 hours · Updated ${t}`;
+      } catch (err) {
+        errorEl.textContent = `Could not load events: ${err.message}`;
+        errorEl.style.display = 'block';
+        statusEl.textContent = 'Error';
+      }
+    }
+
+    fetchAndRender();
+    setInterval(fetchAndRender, REFRESH_MS);
+
+    // SCE widget — fetches once on load (server caches for 24h)
+    async function renderSce() {
+      const el = document.getElementById('sce-widget');
+      try {
+        const resp = await fetch('/api/sce');
+        const d = await resp.json();
+        if (d.error) {
+          el.innerHTML = `<div class="sce-error">SCE: ${d.error}</div>`;
+        } else {
+          el.innerHTML = `
+            <div><div class="sce-label">Balance Due</div><div class="sce-value">${d.balance || '—'}</div></div>
+            <div><div class="sce-label">Due Date</div><div class="sce-value">${d.dueDate || '—'}</div></div>
+            <div><div class="sce-label">Usage This Period</div><div class="sce-value">${d.usage || '—'}</div></div>`;
+        }
+      } catch (err) {
+        el.innerHTML = `<div class="sce-error">SCE unavailable</div>`;
+      }
+    }
+    renderSce();
+  </script>
+</body>
+</html>

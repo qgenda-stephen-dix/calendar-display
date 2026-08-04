@@ -1,0 +1,6 @@
+node_modules
+.git
+.gitignore
+.sce-cache.json
+.env
+*.log
