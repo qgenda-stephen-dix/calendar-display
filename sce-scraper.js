@@ -8,9 +8,16 @@ const puppeteer = require('puppeteer-core');
 const fs        = require('fs');
 const path      = require('path');
 
-const CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const CHROME_PATH = process.env.CHROME_PATH || [
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  '/usr/bin/chromium',
+  '/usr/bin/chromium-browser',
+  '/usr/bin/google-chrome',
+].find(candidate => fs.existsSync(candidate));
 const CACHE_FILE  = path.join(__dirname, '.sce-cache.json');
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const CACHE_TTL_MS       = 24 * 60 * 60 * 1000; // 24 hours — successful scrape
+const ERROR_CACHE_TTL_MS = 15 * 60 * 1000;      // 15 minutes — failed scrape (retry sooner, but don't hammer every request)
+const SCRAPE_TIMEOUT_MS  = 20 * 1000;            // hard cap so a hung browser/login never blocks the dashboard
 
 const LOGIN_URL     = 'https://www.sce.com/mysce/login';
 const DASHBOARD_URL = 'https://www.sce.com/mysce/myaccount';
@@ -19,7 +26,8 @@ function loadCache() {
   try {
     const raw = fs.readFileSync(CACHE_FILE, 'utf8');
     const data = JSON.parse(raw);
-    if (Date.now() - new Date(data.fetchedAt).getTime() < CACHE_TTL_MS) {
+    const ttl = data.error ? ERROR_CACHE_TTL_MS : CACHE_TTL_MS;
+    if (Date.now() - new Date(data.fetchedAt).getTime() < ttl) {
       return data;
     }
   } catch (_) { /* no cache or expired */ }
@@ -36,6 +44,9 @@ async function scrape() {
 
   if (!email || !password) {
     throw new Error('SCE_EMAIL and SCE_PASSWORD must be set in .env');
+  }
+  if (!CHROME_PATH) {
+    throw new Error('No Chrome executable found for SCE scraping');
   }
 
   const browser = await puppeteer.launch({
@@ -123,6 +134,13 @@ async function scrape() {
   }
 }
 
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`SCE scrape timed out after ${ms / 1000}s`)), ms)),
+  ]);
+}
+
 /**
  * Returns cached SCE data if fresh, otherwise re-scrapes.
  * Safe to call from multiple routes — won't double-scrape.
@@ -136,7 +154,7 @@ async function getSceData() {
   // Dedupe concurrent requests
   if (_scrapeInProgress) return _scrapeInProgress;
 
-  _scrapeInProgress = scrape()
+  _scrapeInProgress = withTimeout(scrape(), SCRAPE_TIMEOUT_MS)
     .then(data => {
       const result = { ...data, fetchedAt: new Date().toISOString() };
       saveCache(result);
@@ -144,8 +162,12 @@ async function getSceData() {
     })
     .catch(err => {
       console.error('[SCE] scrape error:', err.message);
-      // Return a graceful fallback so the page still renders
-      return { balance: null, dueDate: null, usage: null, error: err.message, fetchedAt: new Date().toISOString() };
+      // Return a graceful fallback so the page still renders, and cache it
+      // briefly so a broken/slow scrape doesn't re-run (and re-stall the
+      // dashboard) on every single request.
+      const result = { balance: null, dueDate: null, usage: null, error: err.message, fetchedAt: new Date().toISOString() };
+      saveCache(result);
+      return result;
     })
     .finally(() => { _scrapeInProgress = null; });
 

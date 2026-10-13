@@ -8,13 +8,14 @@ const app = express();
 app.use(cors());
 app.use(express.static('public'));
 
+const DISPLAY_TIME_ZONE = 'America/Los_Angeles';
+
 // Priority order matters: first calendar wins the border color on merged events
 const CALENDARS = [
   { id: 'sdix00@gmail.com',            label: 'Stephen',      color: '#818CF8', gray: '#000000' },
-  { id: 'stephen.dix@qgenda.com',      label: 'Stephen Work', color: '#38BDF8', gray: '#444444' },
   { id: 'littlemel1992@gmail.com',     label: 'Melissa',      color: '#F472B6', gray: '#888888' },
   {
-    id: 'nfl_-m-0289q_$enver+Broncos#sports@group.v.calendar.google.com',
+    id: 'nfl_-m-0289q_Denver+Broncos#sports@group.v.calendar.google.com',
     label: 'Broncos',
     color: '#FB923C',
     gray: '#BBBBBB',
@@ -60,7 +61,7 @@ function buildAuth() {
 }
 
 /**
- * Fetch events from all calendars for the next 48 hours, then:
+ * Fetch events from all calendars for the next 21 days, then:
  *   - Deduplicate cross-calendar events by (title + start)
  *   - Roll up calendar labels: "Stephen · Melissa"
  *   - Filter owner emails out of attendee lists (they show as calendar labels)
@@ -70,7 +71,8 @@ async function fetchAndDedupeEvents() {
   const auth = buildAuth();
   const gcal = google.calendar({ version: 'v3', auth });
   const now = new Date();
-  const windowEnd = new Date(now.getTime() + 10 * 24 * 60 * 60 * 1000);
+  const windowEnd = new Date(now.getTime() + 21 * 24 * 60 * 60 * 1000);
+  const today = new Intl.DateTimeFormat('en-CA', { timeZone: DISPLAY_TIME_ZONE }).format(now);
 
   const byKey = new Map(); // dedupKey → merged event object
 
@@ -95,6 +97,7 @@ async function fetchAndDedupeEvents() {
       const start  = ev.start?.dateTime || ev.start?.date;
       const end    = ev.end?.dateTime   || ev.end?.date;
       const allDay = !ev.start?.dateTime;
+      if (allDay && start < today) continue;
       const title  = ev.summary || '(No Title)';
       const key    = `${title}::${start}`;
 
@@ -154,11 +157,12 @@ async function fetchAndDedupeEvents() {
   return { events, fetchedAt: now.toISOString() };
 }
 
-// --- Dashnotes: fetch & parse the published Google Doc (5-min cache) ---
+// --- Dashnotes: fetch & parse the published Google Doc on every request ---
 const DASHNOTES_URL = 'https://docs.google.com/document/d/e/2PACX-1vSNzj_LcdDhnA2hOPHRfcPiOb0Vo1vZ7mwEBigg1MjNXlQQ5i4Iiy2IftjY-8dqKIXtKowMn8VzTdBf/pub';
-const DASHNOTES_TTL = 5 * 60 * 1000;
+const DASHNOTES_TTL = 0;
 let _dashCache = null;
 let _dashCachedAt = 0;
+const SCE_SCRAPE_URL = 'https://www.sce.com/mysce/myaccount';
 
 async function fetchDashnotes() {
   if (_dashCache && Date.now() - _dashCachedAt < DASHNOTES_TTL) return _dashCache;
@@ -200,17 +204,39 @@ app.get('/api/events', async (req, res) => {
   }
 });
 
+// Belt-and-suspenders: the TRMNL device has its own fetch timeout and reports
+// an error if /trmnl doesn't respond in time. SCE data is a non-essential
+// add-on to the page, so never let it stall the whole dashboard.
+function sceDataWithFallback() {
+  const fallback = { balance: null, dueDate: null, usage: null, error: 'SCE data unavailable (timed out)' };
+  return Promise.race([
+    getSceData(),
+    new Promise(resolve => setTimeout(() => resolve(fallback), 25000)),
+  ]);
+}
+
 // Server-rendered page for TRMNL X screenshot pipeline (portrait 1404×1872)
 app.get('/trmnl', async (req, res) => {
+  res.set({
+    'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+    Pragma: 'no-cache',
+    Expires: '0',
+  });
+
   try {
     const [{ events: allEvents, fetchedAt }, sce, notes] = await Promise.all([
       fetchAndDedupeEvents(),
-      getSceData(),
+      sceDataWithFallback(),
       fetchDashnotes(),
     ]);
     const normalizedNotes = notes.map(shortContactList);
     const now = new Date(fetchedAt);
-    const TZ = 'America/Denver';
+    const TZ = 'America/Los_Angeles';
+    const sourceUrl = `${req.protocol}://${req.get('host')}${req.baseUrl || ''}${req.path}`;
+
+    function parseEventDate(iso, allDay) {
+      return allDay ? new Date(`${iso}T12:00:00Z`) : new Date(iso);
+    }
 
     function fmt(iso, allDay) {
       if (allDay) return 'All Day';
@@ -220,7 +246,7 @@ app.get('/trmnl', async (req, res) => {
     }
 
     function dayLabel(iso, allDay) {
-      const d = allDay ? new Date(iso + 'T00:00:00') : new Date(iso);
+      const d = parseEventDate(iso, allDay);
       return d.toLocaleDateString('en-US', { timeZone: TZ, weekday: 'short', month: 'short', day: 'numeric' });
     }
 
@@ -228,7 +254,6 @@ app.get('/trmnl', async (req, res) => {
     function calTag(str) {
       return str.split(' · ').map(s => {
         if (s === 'Stephen') return 'S';
-        if (s === 'Stephen Work') return 'W';
         if (s === 'Melissa') return 'M';
         if (s === 'Broncos') return 'BRO';
         return s.substring(0, 3).toUpperCase();
@@ -236,14 +261,12 @@ app.get('/trmnl', async (req, res) => {
     }
 
     function dayKey(iso, allDay) {
-      const d = allDay ? new Date(`${iso}T00:00:00`) : new Date(iso);
+      const d = parseEventDate(iso, allDay);
       return d.toLocaleDateString('en-CA', { timeZone: TZ });
     }
 
     function sortValue(ev) {
-      return ev.allDay
-        ? new Date(`${ev.start}T00:00:00`).getTime()
-        : new Date(ev.start).getTime();
+      return parseEventDate(ev.start, ev.allDay).getTime();
     }
 
     const orderedEvents = [...allEvents].sort((a, b) => sortValue(a) - sortValue(b));
@@ -306,6 +329,9 @@ app.get('/trmnl', async (req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=1872">
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body {
@@ -323,7 +349,9 @@ app.get('/trmnl', async (req, res) => {
     position: relative;
     width: 1872px;
     height: 1404px;
-    padding: 24px 42px 96px 42px;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr) auto auto;
+    padding: 24px 42px 8px;
     outline: 1.5px solid #aaa;
     outline-offset: -1px;
   }
@@ -335,8 +363,8 @@ app.get('/trmnl', async (req, res) => {
     padding-bottom: 10px;
     margin-bottom: 6px;
   }
-  .hdr-title { font-size: 30px; font-weight: 700; letter-spacing: -0.3px; }
-  .hdr-sub   { font-size: 15px; color: #777; }
+  .hdr-title { font-size: 43.68px; font-weight: 700; letter-spacing: -0.3px; }
+  .hdr-sub   { font-size: 24.96px; color: #777; }
   /* Day separator: small-caps label + thin rule */
   .day-sep {
     display: flex;
@@ -345,7 +373,7 @@ app.get('/trmnl', async (req, res) => {
     margin: 14px 0 2px 0;
   }
   .day-lbl {
-    font-size: 11px;
+    font-size: 24.96px;
     font-weight: 800;
     text-transform: uppercase;
     letter-spacing: 0.16em;
@@ -356,54 +384,50 @@ app.get('/trmnl', async (req, res) => {
   /* Event row: 2-col grid — time fixed | content fills. Cal tag inline, no right-float gap. */
   .evt {
     display: grid;
-    grid-template-columns: 84px 1fr;
+    grid-template-columns: 150px minmax(0, 1fr);
     align-items: baseline;
-    gap: 0 6px;
-    padding: 4px 8px 4px 7px;
+    gap: 0 10px;
+    padding: 5px 10px 5px 8px;
     border-left: 4px solid #000;
     margin-bottom: 1px;
     background: #f9f9f9;
   }
   .evt:nth-child(even) { background: #fff; }
   .evt-time {
-    font-size: 14px;
+    font-size: 27.04px;
     font-weight: 700;
     color: #333;
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }
   .evt-body {
-    font-size: 16px;
+    font-size: 27.04px;
     font-weight: 600;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
   .evt-sub {
-    font-size: 12px;
-    font-weight: 400;
-    color: #888;
+    font-size: 20.8px;
+    font-weight: 800;
+    color: #444;
     margin-left: 4px;
   }
   .evt-cal {
-    font-size: 10px;
+    font-size: 20.8px;
     font-weight: 800;
-    color: #bbb;
+    color: #444;
     text-transform: uppercase;
     letter-spacing: 0.05em;
     margin-left: 6px;
   }
   /* Two-column: calendar left, notes right */
   .content-cols {
-    position: absolute;
-    left: 42px;
-    right: 42px;
-    top: 72px;
-    bottom: 118px;
     display: flex;
     gap: 24px;
     align-items: flex-start;
     overflow: hidden;
+    min-height: 0;
   }
   .cal-col {
     flex: 2.35;
@@ -420,7 +444,7 @@ app.get('/trmnl', async (req, res) => {
     overflow: hidden;
   }
   .notes-col-hdr {
-    font-size: 11px;
+    font-size: 20.8px;
     font-weight: 800;
     text-transform: uppercase;
     letter-spacing: 0.16em;
@@ -430,12 +454,12 @@ app.get('/trmnl', async (req, res) => {
     margin-bottom: 4px;
   }
   .note-item {
-    font-size: 15px;
+    font-size: 27.04px;
     font-weight: 500;
     padding: 4px 0;
     border-bottom: 1px solid #f0f0f0;
     line-height: 1.35;
-    color: #111;
+    color: #000;
   }
   /* Rolled-up: spans both grid columns */
   .evt-rolled {
@@ -448,7 +472,7 @@ app.get('/trmnl', async (req, res) => {
     text-overflow: ellipsis;
   }
   .evt-times {
-    font-size: 12px;
+    font-size: 17.68px;
     font-weight: 700;
     color: #444;
     white-space: nowrap;
@@ -457,42 +481,35 @@ app.get('/trmnl', async (req, res) => {
   }
   /* SCE — pinned to bottom of canvas */
   .sce {
-    position: absolute;
-    bottom: 34px;
-    left: 0;
-    right: 0;
-    padding: 10px 44px 20px 44px;
+    padding: 10px 2px 20px;
     border-top: 2px solid #000;
     background: #fff;
   }
   .sce-hdr {
-    font-size: 10px;
+    font-size: 20.8px;
     font-weight: 800;
     text-transform: uppercase;
     letter-spacing: 0.18em;
-    color: #777;
+    color: #444;
     margin-bottom: 8px;
   }
   .sce-row { display: flex; gap: 44px; align-items: baseline; flex-wrap: wrap; }
   .sce-lbl {
-    font-size: 10px;
+    font-size: 20.8px;
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.12em;
-    color: #999;
+    color: #444;
     margin-bottom: 2px;
   }
-  .sce-val    { font-size: 26px; font-weight: 700; color: #000; }
-  .sce-val-sm { font-size: 18px; font-weight: 600; color: #222; }
-  .sce-error  { font-size: 13px; color: #aaa; font-style: italic; }
+  .sce-val    { font-size: 35.36px; font-weight: 700; color: #000; }
+  .sce-bill-val { font-size: 37.44px; font-weight: 700; color: #000; }
+  .sce-val-sm { font-size: 27.04px; font-weight: 600; color: #222; }
+  .sce-error  { font-size: 21.84px; color: #aaa; font-style: italic; }
   footer {
-    position: absolute;
-    left: 42px;
-    right: 42px;
-    bottom: 8px;
     border-top: 1px solid #ddd;
     padding-top: 6px;
-    font-size: 11px;
+    font-size: 19.76px;
     color: #bbb;
   }
 </style>
@@ -501,28 +518,33 @@ app.get('/trmnl', async (req, res) => {
 <div class="stage">
 <header>
   <span class="hdr-title">Upcoming Events</span>
-  <span class="hdr-sub">10 days · ${updatedAt}</span>
+  <span class="hdr-sub">21 days · ${updatedAt}</span>
 </header>
 <div class="content-cols">
-  <div class="cal-col">${rows || '<div style="padding:12px 0;color:#aaa;font-size:14px">No events in the next 10 days.</div>'}</div>
+  <div class="cal-col">${rows || '<div style="padding:12px 0;color:#aaa;font-size:18.72px">No events in the next 10 days.</div>'}</div>
   ${normalizedNotes.length ? `<div class="notes-col"><div class="notes-col-hdr">Notes</div>${normalizedNotes.map(n => `<div class="note-item">${n}</div>`).join('')}</div>` : ''}
 </div>
 <div class="sce">
   <div class="sce-hdr">SoCal Edison</div>
   ${sce.error ? `<div class="sce-error">${sce.error}</div>` : `<div class="sce-row">
-    ${sce.projectedBill ? `<div><div class="sce-lbl">Proj. Bill</div><div class="sce-val">${sce.projectedBill}</div></div>` : ''}
+    ${sce.projectedBill ? `<div><div class="sce-lbl">Proj. Bill</div><div class="sce-bill-val">${sce.projectedBill}</div></div>` : ''}
     <div><div class="sce-lbl">Due Date</div><div class="sce-val${sce.projectedBill ? '-sm' : ''}">${sce.dueDate || '—'}</div></div>
     ${sce.projectedKwh ? `<div><div class="sce-lbl">Proj. Usage</div><div class="sce-val-sm">${sce.projectedKwh}</div></div>` : ''}
     ${sce.usageToDateAmt ? `<div><div class="sce-lbl">To Date</div><div class="sce-val-sm">${sce.usageToDateAmt} · ${sce.usageToDateKwh || ''}</div></div>` : ''}
     ${sce.lastPayment ? `<div><div class="sce-lbl">Last Payment</div><div class="sce-val-sm">${sce.lastPayment}</div></div>` : ''}
   </div>`}
 </div>
-<footer>Calendars: Stephen · Work · Melissa · Broncos &nbsp;|&nbsp; SCE updated ${sceDate}</footer>
+<footer>Calendars: ${CALENDARS.map(calendar => calendar.label).join(' · ')} &nbsp;|&nbsp; SCE updated ${sceDate} &nbsp;|&nbsp; Source: ${sourceUrl}</footer>
 </div>
 </body>
 </html>`;
 
-    res.setHeader('Content-Type', 'text/html');
+    res.set({
+      'Content-Type': 'text/html',
+      'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0, s-maxage=0',
+      'Pragma': 'no-cache',
+      'Expires': '0',
+    });
     res.send(html);
   } catch (err) {
     console.error('TRMNL render error:', err);
