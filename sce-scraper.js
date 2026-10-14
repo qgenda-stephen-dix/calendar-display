@@ -34,6 +34,17 @@ function loadCache() {
   return null;
 }
 
+// Like loadCache(), but ignores TTL — used to seed the in-memory value at
+// startup so the dashboard has *something* to show (stale-while-revalidate)
+// instead of a blank widget on the very first request after a cold start.
+function loadCacheIgnoringTtl() {
+  try {
+    return JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+  } catch (_) {
+    return null;
+  }
+}
+
 function saveCache(data) {
   fs.writeFileSync(CACHE_FILE, JSON.stringify(data, null, 2));
 }
@@ -141,37 +152,50 @@ function withTimeout(promise, ms) {
   ]);
 }
 
-/**
- * Returns cached SCE data if fresh, otherwise re-scrapes.
- * Safe to call from multiple routes — won't double-scrape.
- */
-let _scrapeInProgress = null;
+// In-memory, stale-while-revalidate cache. Seeded at module load from disk
+// (ignoring TTL) so the very first request after a cold start still has
+// *something* to show instead of blocking or rendering blank.
+let _memoryCache = loadCacheIgnoringTtl() || {
+  balance: null, dueDate: null, usage: null,
+  error: 'SCE data not yet fetched', fetchedAt: new Date(0).toISOString(),
+};
+let _scrapeInProgress = false;
 
-async function getSceData() {
-  const cached = loadCache();
-  if (cached) return cached;
+function refreshInBackground() {
+  if (_scrapeInProgress) return;
+  if (loadCache()) return; // still fresh, nothing to do
+  _scrapeInProgress = true;
 
-  // Dedupe concurrent requests
-  if (_scrapeInProgress) return _scrapeInProgress;
-
-  _scrapeInProgress = withTimeout(scrape(), SCRAPE_TIMEOUT_MS)
+  withTimeout(scrape(), SCRAPE_TIMEOUT_MS)
     .then(data => {
       const result = { ...data, fetchedAt: new Date().toISOString() };
+      _memoryCache = result;
       saveCache(result);
-      return result;
     })
     .catch(err => {
       console.error('[SCE] scrape error:', err.message);
-      // Return a graceful fallback so the page still renders, and cache it
-      // briefly so a broken/slow scrape doesn't re-run (and re-stall the
-      // dashboard) on every single request.
-      const result = { balance: null, dueDate: null, usage: null, error: err.message, fetchedAt: new Date().toISOString() };
+      // Keep showing the last known-good value if we have one; only
+      // overwrite with an error placeholder if we've never had real data.
+      const result = _memoryCache && !_memoryCache.error
+        ? { ..._memoryCache, error: err.message, fetchedAt: new Date().toISOString() }
+        : { balance: null, dueDate: null, usage: null, error: err.message, fetchedAt: new Date().toISOString() };
+      _memoryCache = result;
       saveCache(result);
-      return result;
     })
-    .finally(() => { _scrapeInProgress = null; });
+    .finally(() => { _scrapeInProgress = false; });
+}
 
-  return _scrapeInProgress;
+/**
+ * Returns the current best-known SCE data *immediately*, never blocking on
+ * a scrape. If the cache is stale, kicks off a refresh in the background
+ * (fire-and-forget) for the *next* request to pick up. This guarantees
+ * callers like /trmnl can never be slowed down by a hung/slow SCE scrape —
+ * critical because external renderers (e.g. TRMNL's screenshot pipeline)
+ * have much shorter timeouts than a browser tab.
+ */
+function getSceData() {
+  refreshInBackground();
+  return _memoryCache;
 }
 
 module.exports = { getSceData };

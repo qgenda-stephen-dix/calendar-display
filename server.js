@@ -204,17 +204,6 @@ app.get('/api/events', async (req, res) => {
   }
 });
 
-// Belt-and-suspenders: the TRMNL device has its own fetch timeout and reports
-// an error if /trmnl doesn't respond in time. SCE data is a non-essential
-// add-on to the page, so never let it stall the whole dashboard.
-function sceDataWithFallback() {
-  const fallback = { balance: null, dueDate: null, usage: null, error: 'SCE data unavailable (timed out)' };
-  return Promise.race([
-    getSceData(),
-    new Promise(resolve => setTimeout(() => resolve(fallback), 25000)),
-  ]);
-}
-
 // Server-rendered page for TRMNL X screenshot pipeline (portrait 1404×1872)
 app.get('/trmnl', async (req, res) => {
   res.set({
@@ -224,11 +213,14 @@ app.get('/trmnl', async (req, res) => {
   });
 
   try {
-    const [{ events: allEvents, fetchedAt }, sce, notes] = await Promise.all([
+    // getSceData() is synchronous/non-blocking: it returns the last known
+    // value immediately and refreshes stale data in the background, so SCE
+    // can never slow down (let alone time out) this response.
+    const [{ events: allEvents, fetchedAt }, notes] = await Promise.all([
       fetchAndDedupeEvents(),
-      sceDataWithFallback(),
       fetchDashnotes(),
     ]);
+    const sce = getSceData();
     const normalizedNotes = notes.map(shortContactList);
     const now = new Date(fetchedAt);
     const TZ = 'America/Los_Angeles';
@@ -552,14 +544,9 @@ app.get('/trmnl', async (req, res) => {
   }
 });
 
-// SCE account data (cached 24 h)
-app.get('/api/sce', async (req, res) => {
-  try {
-    const data = await getSceData();
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+// SCE account data (non-blocking; refreshes in the background, see sce-scraper.js)
+app.get('/api/sce', (req, res) => {
+  res.json(getSceData());
 });
 
 // Health check
